@@ -448,12 +448,19 @@ await con.query(`
     message TEXT,
     booking_date DATETIME NOT NULL,
     status ENUM('pending','accepted','rejected') NOT NULL DEFAULT 'pending',
+    payment_status ENUM('pending','paid') NOT NULL DEFAULT 'pending',
+    payment_amount DECIMAL(10,2) NOT NULL DEFAULT 0,
+    payment_updated_at TIMESTAMP NULL DEFAULT NULL,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     INDEX idx_artist_date (artist_id, booking_date),
     INDEX idx_hirer_date (hirer_id, booking_date),
     FOREIGN KEY (artist_id) REFERENCES artists(id) ON DELETE CASCADE
   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 `);
+// Migrations for existing tables
+try { await con.query("ALTER TABLE bookings ADD COLUMN payment_status ENUM('pending','paid') NOT NULL DEFAULT 'pending'"); } catch (e) {}
+try { await con.query("ALTER TABLE bookings ADD COLUMN payment_amount DECIMAL(10,2) NOT NULL DEFAULT 0"); } catch (e) {}
+try { await con.query("ALTER TABLE bookings ADD COLUMN payment_updated_at TIMESTAMP NULL DEFAULT NULL"); } catch (e) {}
 
 // -------------------- Chat tables --------------------
 await con.query(`
@@ -593,8 +600,8 @@ app.post("/api/hirer/bookings", authHirer, async (req, res) => {
       "INSERT INTO bookings (hirer_id, artist_id, project_title, message, booking_date) VALUES (?,?,?,?,?)",
       [req.userId, artistId, projectTitle, message || "", new Date(dt)]
     );
-    const [[row]] = await con.query(
-      "SELECT b.id, b.hirer_id, b.artist_id, b.project_title, b.message, b.booking_date, b.status, b.created_at, h.fullname AS hirer_name FROM bookings b JOIN hirers h ON h.id=b.hirer_id WHERE b.id=?",
+const [[row]] = await con.query(
+      "SELECT b.id, b.hirer_id, b.artist_id, b.project_title, b.message, b.booking_date, b.status, b.payment_status, b.payment_amount, b.payment_updated_at, b.created_at, h.fullname AS hirer_name FROM bookings b JOIN hirers h ON h.id=b.hirer_id WHERE b.id=?",
       [ins.insertId]
     );
     // notify artist in realtime
@@ -608,8 +615,8 @@ app.post("/api/hirer/bookings", authHirer, async (req, res) => {
 // Artist: list bookings
 app.get("/api/artist/bookings", authArtist, async (req, res) => {
   try {
-    const [rows] = await con.query(
-      "SELECT b.id, b.hirer_id, b.artist_id, b.project_title, b.message, b.booking_date, b.status, b.created_at, h.fullname AS hirer_name FROM bookings b JOIN hirers h ON h.id=b.hirer_id WHERE b.artist_id = ? ORDER BY b.created_at DESC",
+const [rows] = await con.query(
+      "SELECT b.id, b.hirer_id, b.artist_id, b.project_title, b.message, b.booking_date, b.status, b.payment_status, b.payment_amount, b.payment_updated_at, b.created_at, h.fullname AS hirer_name FROM bookings b JOIN hirers h ON h.id=b.hirer_id WHERE b.artist_id = ? ORDER BY b.created_at DESC",
       [req.userId]
     );
     return res.json(rows);
@@ -628,7 +635,7 @@ app.patch("/api/artist/bookings/:id", authArtist, async (req, res) => {
     if (!b || b.artist_id !== req.userId) return res.status(404).json({ msg: "Not found" });
     await con.query("UPDATE bookings SET status=? WHERE id=?", [status, id]);
     const [[row]] = await con.query(
-      "SELECT b.id, b.hirer_id, b.artist_id, b.project_title, b.message, b.booking_date, b.status, b.created_at, h.fullname AS hirer_name FROM bookings b JOIN hirers h ON h.id=b.hirer_id WHERE b.id=?",
+      "SELECT b.id, b.hirer_id, b.artist_id, b.project_title, b.message, b.booking_date, b.status, b.payment_status, b.payment_amount, b.payment_updated_at, b.created_at, h.fullname AS hirer_name FROM bookings b JOIN hirers h ON h.id=b.hirer_id WHERE b.id=?",
       [id]
     );
     // notify both sides
@@ -640,11 +647,63 @@ app.patch("/api/artist/bookings/:id", authArtist, async (req, res) => {
   }
 });
 
+// Artist: set or update payment amount (quote)
+app.patch("/api/artist/bookings/:id/quote", authArtist, async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    const { amount } = req.body;
+    if (!id) return res.status(400).json({ msg: 'Invalid id' });
+    const amt = amount != null && !isNaN(parseFloat(amount)) ? parseFloat(amount) : null;
+    if (amt == null || amt < 0) return res.status(400).json({ msg: 'Invalid amount' });
+    const [[b]] = await con.query("SELECT id, hirer_id, artist_id FROM bookings WHERE id=?", [id]);
+    if (!b || b.artist_id !== req.userId) return res.status(404).json({ msg: 'Not found' });
+    await con.query("UPDATE bookings SET payment_amount=?, payment_status='pending' WHERE id=?", [amt, id]);
+    const [[row]] = await con.query(
+      "SELECT b.id, b.hirer_id, b.artist_id, b.project_title, b.message, b.booking_date, b.status, b.payment_status, b.payment_amount, b.payment_updated_at, b.created_at, h.fullname AS hirer_name FROM bookings b JOIN hirers h ON h.id=b.hirer_id WHERE b.id=?",
+      [id]
+    );
+    io.to(`user:artist:${row.artist_id}`).emit("booking:update", row);
+    io.to(`user:hirer:${row.hirer_id}`).emit("booking:update", row);
+    return res.json(row);
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// Hirer: update payment status
+app.patch("/api/hirer/bookings/:id/payment", authHirer, async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    const { status, amount } = req.body; // status 'paid'|'pending'
+    if (!id || !['paid','pending'].includes(status)) return res.status(400).json({ msg: 'Invalid' });
+    const [[b]] = await con.query("SELECT id, hirer_id, artist_id FROM bookings WHERE id=?", [id]);
+    if (!b || b.hirer_id !== req.userId) return res.status(404).json({ msg: 'Not found' });
+    const amt = amount != null && !isNaN(parseFloat(amount)) ? parseFloat(amount) : null;
+    if (status === 'paid' && (amt == null || amt < 0)) return res.status(400).json({ msg: 'Amount required for paid' });
+    await con.query("UPDATE bookings SET payment_status=?, payment_amount=COALESCE(?, payment_amount), payment_updated_at=NOW() WHERE id=?", [status, amt, id]);
+    const [[row]] = await con.query(
+      `SELECT b.id, b.hirer_id, b.artist_id, b.project_title, b.message, b.booking_date, b.status,
+              b.payment_status, b.payment_amount, b.payment_updated_at, b.created_at,
+              COALESCE(ap.full_name, a.fullname) AS artist_name
+       FROM bookings b
+       JOIN artists a ON a.id=b.artist_id
+       LEFT JOIN artist_profiles ap ON ap.artist_id=a.id
+       WHERE b.id=?`,
+      [id]
+    );
+    io.to(`user:artist:${row.artist_id}`).emit("booking:update", row);
+    io.to(`user:hirer:${row.hirer_id}`).emit("booking:update", row);
+    return res.json(row);
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
 // Hirer: list their bookings
 app.get("/api/hirer/bookings", authHirer, async (req, res) => {
   try {
-    const [rows] = await con.query(
-      `SELECT b.id, b.hirer_id, b.artist_id, b.project_title, b.message, b.booking_date, b.status, b.created_at,
+const [rows] = await con.query(
+      `SELECT b.id, b.hirer_id, b.artist_id, b.project_title, b.message, b.booking_date, b.status, b.payment_status, b.payment_amount, b.payment_updated_at, b.created_at,
               COALESCE(ap.full_name, a.fullname) AS artist_name
        FROM bookings b
        JOIN artists a ON a.id=b.artist_id
